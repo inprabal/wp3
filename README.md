@@ -660,14 +660,9 @@ The following points should be checked against the setup script before declaring
 **Pending:** Cross-validation against `wp3-isolation-setup.sh` and live verification of the rollback recovery procedure.
 
 ---
-
-**End of Appendix A — WP3 Isolation Rollback Architecture**
-
 ## 12. Planned improvements
 
 ### Phase 1 — Documentation
-- Complete isolation preflight documentation.
-- Document isolation setup and rollback.
 - Document firewall rule dependencies.
 - Produce a definitive execution/dependency map.
 
@@ -705,6 +700,500 @@ As of 21 November 2026:
 - The core WP3 patch has been validated.
 
 The latest successful AP test is encouraging, but long-duration stability remains under observation.
+
+# Appendix B — WP3 Audit and Isolation Management Scripts
+
+**Project:** WiFi-Pumpkin3 on Kali Linux / Raspberry Pi  
+**Documentation date:** 21 November 2026  
+**Scope:** `wp3-audit.sh`, `wp3-isolation-preflight.sh`, `wp3-isolation-setup.sh`, `wp3-isolation-rollback.sh`
+
+---
+
+## B.1 Overview
+
+The WP3 isolation management toolkit contains four scripts with distinct responsibilities.
+
+| Script | Primary responsibility | Operating mode |
+|---|---|---|
+| `wp3-audit.sh` | Audit WP3 installation, configuration, host networking, firewall and source code | Read-only, optional report output |
+| `wp3-isolation-preflight.sh` | Verify host readiness and isolation prerequisites | Read-only |
+| `wp3-isolation-setup.sh` | Create Stage 1 namespace and network isolation infrastructure | Dry-run by default; confirmed apply |
+| `wp3-isolation-rollback.sh` | Remove resources created by Stage 1 setup | Dry-run by default; explicit apply |
+
+The two audit scripts are complementary. `wp3-audit.sh` examines the existing WP3 installation and its potential source-code risks. `wp3-isolation-preflight.sh` evaluates whether the host is suitable for the proposed isolation setup.
+
+Neither read-only script replaces the need for source review or controlled setup/rollback testing.
+
+## B.2 `wp3-audit.sh` — Installation and Configuration Audit
+
+### Purpose
+
+Performs a read-only audit of the existing WiFi-Pumpkin3 installation and the surrounding Kali/Debian environment.
+
+The script explicitly avoids starting or stopping WP3, modifying network configuration, changing firewall rules, editing WP3 configuration or stopping Docker containers.
+
+### Configurable inputs
+
+| Parameter | Default |
+|---|---|
+| Wireless interface | `wlan2` |
+| Planned AP subnet | `172.16.0.0/24` |
+| WP3 application configuration | `/root/.config/wifipumpkin3/config/app/config.ini` |
+| Proxy configuration | `/root/.config/wifipumpkin3/config/app/pumpkinproxy.ini` |
+| Installed WP3 source | `/usr/lib/python3/dist-packages/wifipumpkin3` |
+| Report directory | Disabled by default |
+
+Command-line options allow the operator to override these paths and values.
+
+### Audit coverage
+
+1. **System information**
+   - OS, kernel and architecture.
+   - Execution identity and privileges.
+   - WP3 executable and version.
+   - Installed Python package directory.
+
+2. **Wireless interface and driver**
+   - Interface state and IP addresses.
+   - Wireless PHY and supported interface modes.
+   - Advertised interface combinations.
+   - Driver information using `ethtool`, when available.
+   - NetworkManager device status.
+
+3. **IP addresses and routing**
+   - Host interface addresses.
+   - IPv4 and IPv6 routing tables.
+   - Route lookup for the planned AP subnet.
+
+4. **AP subnet validation**
+   - Validates CIDR syntax using Python `ipaddress`.
+   - Displays normalized network, network address, broadcast address and usable host count.
+   - Does not automatically calculate overlap against all host routes or Docker networks.
+
+5. **Docker**
+   - Running containers.
+   - Docker networks.
+   - Docker network subnets and gateways.
+
+6. **Firewall visibility**
+   - IPv4 filter and NAT rules.
+   - IPv6 filter rules.
+   - Presence of historical firewall snapshots:
+     - `/root/wp3-iptables-before.txt`
+     - `/root/wp3-ip6tables-before.txt`
+
+7. **WP3 application configuration**
+   - Selected `[accesspoint]` settings.
+   - Selected `[dhcp]` settings.
+   - DHCP subnet, netmask and router population.
+   - AP status configuration.
+
+8. **Proxy and injection configuration**
+   - Reads plugin flags from `pumpkinproxy.ini`.
+   - Reviews `downloadspoof`, `js_inject`, `html_inject`, `beef` and `no-cache`.
+   - Warns when relevant plugin flags are enabled.
+
+9. **Source-code audit locators**
+   - Firewall flush/delete call sites.
+   - DNS and DHCP thread lifecycle references.
+   - Proxy redirect and cleanup references.
+
+### Embedded source-review findings
+
+The script records six findings from the earlier WP3 source investigation:
+
+1. Static AP configuration contained global iptables filter/NAT flush and chain-deletion operations.
+2. PumpkinProxy registered a TCP/80 PREROUTING redirect without an ingress-interface restriction.
+3. Proxy shutdown did not visibly establish cleanup of all default rules registered through `add_default_rules()`.
+4. DHCP shutdown did not demonstrate complete, exception-safe process termination.
+5. DNS shutdown required verification against the concrete UDP/TCP server stop implementation.
+6. The wireless PHY did not advertise supported interface combinations; simultaneous managed and AP operation must not be assumed.
+
+These are historical source-review findings. They are not runtime test results produced by this script. They must be reassessed against the current installed source after the subsequent WP3 core patch.
+
+### Reporting and exit codes
+
+The script tracks PASS, WARN, FAIL and INFO results.
+
+An optional `--outdir` argument writes a timestamped text report to an existing directory. Without this option, the script reports to the terminal.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | No FAIL or WARN results |
+| `1` | One or more FAIL results |
+| `2` | No FAIL results, but one or more WARN results |
+
+A clean report does not certify that WP3 is safe to start.
+
+---
+
+## B.3 `wp3-isolation-preflight.sh` — Isolation Readiness Verification
+
+### Purpose
+
+Performs a read-only compatibility and safety assessment before running Stage 1 isolation setup.
+
+The script does not create or delete namespaces, change interface states or addresses, modify routes or firewall rules, start or stop WP3/BeEF/Docker, or modify configuration files.
+
+### Configuration
+
+Reads:
+
+`wp3-isolation.conf`
+
+The configuration path is resolved relative to the script's own directory.
+
+Required configuration values include:
+
+- `WP3_INTERFACE`
+- `UPLINK_INTERFACE`
+- `WP3_NETNS`
+- `WP3_SUBNET`
+- `WP3_GATEWAY`
+- `TRANSIT_SUBNET`
+- `TRANSIT_HOST_IP`
+- `TRANSIT_NS_IP`
+- `WP3_STATE_DIR`
+
+### Preflight coverage
+
+1. **Execution and configuration**
+   - Root privilege check.
+   - Configuration availability and readability.
+   - Required configuration variables.
+   - Key isolation network values.
+
+2. **Required and optional commands**
+   - Required: `ip`, `iw`, `ss`, `grep`, `awk`, `sed`, `python3`.
+   - Optional: firewall tools, hostapd, dnsmasq, arp-scan and Docker.
+
+3. **Wireless interface**
+   - AP interface existence.
+   - Wireless PHY identification.
+   - Advertised AP mode capability.
+   - Interface combination capability.
+
+4. **Internet uplink**
+   - Route lookup to `1.1.1.1`.
+   - Configured uplink interface state.
+   - Explicit warning that route selection does not establish internet reachability.
+
+5. **Network namespace support**
+   - `ip netns list`.
+   - Existing namespaces.
+   - `/run/netns` availability.
+
+6. **Docker preservation**
+   - Docker daemon accessibility.
+   - Running container count and inventory.
+   - Docker network inventory.
+   - Warning when fewer than three containers are running.
+
+7. **BeEF port**
+   - TCP listener check for port 3000.
+   - Warning if a listener exists or no listener is detected.
+
+8. **WP3 installation**
+   - WP3 executable availability.
+   - Installed Python source directory.
+
+9. **Global firewall operation audit**
+   - Searches installed Python source for potential iptables/ip6tables flush and delete-chain operations.
+   - Displays up to 20 matches.
+   - This is a text-pattern scan, not a complete static security analysis.
+
+10. **Subnet overlap verification**
+    - Checks the WP3 AP and transit subnets against configured Docker networks, private LAN networks and discoverable actual Docker networks.
+    - Uses Python `ipaddress` overlap calculations.
+    - Invalid network declarations produce failure.
+
+11. **IPv6 and firewall visibility**
+    - Reports host IPv6 disabled flag.
+    - Checks whether host IPv4 and IPv6 firewall rules are readable.
+
+### Known limitations and improvement candidates
+
+- The AP subnet and transit subnet are not explicitly compared against each other.
+- Text matching cannot identify every possible form of dynamic firewall command construction.
+- A route lookup does not prove external connectivity.
+- Firewall readability does not establish that firewall policy is correct.
+- The configured private LAN ranges may not represent every reachable network.
+- The three-container Docker expectation is a diagnostic warning, not a technical prerequisite.
+- Configuration path handling differs from the setup script's default path behaviour.
+
+### Final reporting
+
+The script reports PASS, WARN and FAIL counts and prints either:
+
+- `PRELIMINARY PREFLIGHT PASSED`, when no FAIL is recorded.
+- `PREFLIGHT FAILED`, when one or more FAIL results are recorded.
+
+Warnings must be reviewed before setup.
+
+The reviewed final section does not visibly issue an explicit non-zero exit when FAIL is recorded. Its exit-code behaviour should therefore be verified before using it as an automated setup gate.
+
+---
+
+## B.4 `wp3-isolation-setup.sh` — Stage 1 Isolation Setup
+
+### Purpose
+
+Creates the initial network isolation infrastructure for WP3 using a dedicated network namespace and a host-side virtual Ethernet pair.
+
+The script is designed to preserve the existing host networking and Docker infrastructure.
+
+### Safety controls
+
+- Default operation is DRY RUN.
+- Actual changes require `--apply`.
+- Requires root privileges.
+- Requires interactive confirmation.
+- Operator must type exactly:
+
+`CREATE-WP3-NAMESPACE`
+
+- Uses `set -Eeuo pipefail`.
+- Uses restrictive file creation permissions.
+- Tracks created resources for error cleanup.
+
+### Explicit exclusions
+
+Stage 1 setup does not:
+
+- Move `wlan2` into the namespace.
+- Change NetworkManager or wpa_supplicant.
+- Start WP3 or hostapd.
+- Change host-wide IPv4 forwarding.
+- Flush or rewrite existing firewall chains.
+- Stop or modify Docker.
+
+### Network configuration
+
+| Resource | Value |
+|---|---|
+| Namespace | `wp3-ns` |
+| AP interface | `wlan2` |
+| Uplink | `eth0` |
+| Protected interfaces | `eth0`, `wlan0` |
+| Host veth | `veth-wp3-host` |
+| Namespace veth | `veth-wp3-ns` |
+| AP subnet | `172.16.0.0/24` |
+| AP gateway | `172.16.0.1` |
+| DHCP pool | `172.16.0.100–172.16.0.150` |
+| Transit subnet | `169.254.250.0/30` |
+| Host transit IP | `169.254.250.1` |
+| Namespace transit IP | `169.254.250.2` |
+
+### Setup sequence
+
+1. Validate configuration, required commands and host prerequisites.
+2. Refuse to adopt existing namespace/veth resources or reserved firewall chains.
+3. Check that the host route, uplink and AP interface meet setup requirements.
+4. Display the planned operations.
+5. Obtain explicit operator confirmation.
+6. Create the state directory and initialize resource tracking.
+7. Create the network namespace.
+8. Create the veth pair and move the namespace side into `wp3-ns`.
+9. Configure host and namespace transit addresses.
+10. Add host route for the AP subnet through the namespace transit address.
+11. Configure namespace loopback and default route.
+12. Create dedicated host IPv4 firewall chains and attach them to INPUT/FORWARD.
+13. Install host IPv6 blocking rules for the veth path.
+14. Configure host NAT rules.
+15. Configure namespace IPv4 and IPv6 policies.
+16. Write the completed setup state file.
+
+### Firewall design
+
+Dedicated host chains:
+
+- `WP3_ISO_IN`
+- `WP3_ISO_FWD`
+
+The host INPUT chain drops traffic arriving from the namespace veth.
+
+The host FORWARD chain provides controlled forwarding between the namespace transit path and uplink, with established-reply handling and a final DROP policy.
+
+Namespace policy:
+
+| Chain | Policy |
+|---|---|
+| IPv4 INPUT | DROP |
+| IPv4 FORWARD | DROP |
+| IPv4 OUTPUT | ACCEPT |
+| IPv6 INPUT | DROP |
+| IPv6 FORWARD | DROP |
+| IPv6 OUTPUT | DROP |
+
+IPv4 forwarding is enabled inside the namespace only.
+
+### NAT rules
+
+The setup creates four tagged NAT rules:
+
+1. `WP3_ISOLATION_NAT` — AP subnet masquerading.
+2. `WP3_ISOLATION_DNS_UDP` — namespace UDP DNS NAT.
+3. `WP3_ISOLATION_DNS_TCP` — namespace TCP DNS NAT.
+4. `WP3_ISOLATION_TRANSIT_NAT` — general namespace transit NAT.
+
+**Important policy clarification:** Although some comments describe DNS-only forwarding, the actual host FORWARD and POSTROUTING rules permit and NAT general namespace-originated traffic from `TRANSIT_NS_IP` through the uplink. Namespace IPv4 OUTPUT is also ACCEPT.
+
+Therefore, the implementation does not restrict namespace outbound traffic to DNS alone. This must be treated as an explicit policy decision and documented consistently.
+
+### State file
+
+On successful completion, the script creates:
+
+`/var/lib/wp3-isolation/setup.state`
+
+Expected permissions: `0600`.
+
+The state records the completed Stage 1 setup, resource names, network values, firewall chain names, NAT comments and relevant resource flags.
+
+### Error handling
+
+An EXIT trap attempts to remove resources created by an unsuccessful setup, including NAT rules, firewall references/chains, routes, veth and namespace.
+
+Cleanup failures are generally suppressed to preserve the original failure status. A partially written state file may remain if setup fails during state-file creation or finalization; inspect actual system state before attempting recovery.
+
+---
+
+## B.5 `wp3-isolation-rollback.sh` — Stage 1 Isolation Rollback
+
+### Purpose
+
+Removes Stage 1 resources recorded in the setup state file.
+
+It is not intended to recover an interrupted setup that never produced a valid completed state file.
+
+### Safety and validation
+
+- Default operation is DRY RUN.
+- Actual removal requires `--apply`.
+- Uses the isolation configuration file and recorded state.
+- Requires a valid state file with permissions exactly `0600`.
+- Requires `WP3_SETUP_STAGE1=complete`.
+- Validates recorded configuration values against the current configuration.
+- Checks expected firewall chain names, NAT comments and state flags.
+- Reads state as key/value data rather than executing it as shell code.
+
+### Rollback sequence
+
+1. Remove host IPv4 INPUT jump and dedicated INPUT chain.
+2. Remove host IPv4 FORWARD jumps and dedicated FORWARD chain.
+3. Remove host IPv6 INPUT and FORWARD DROP rules.
+4. Remove the four tagged host NAT rules.
+5. Remove the exact AP subnet host route.
+6. Delete the network namespace.
+7. Delete the host veth if it remains.
+8. Remove the state file only after successful rollback.
+
+The namespace-side veth is expected to disappear when the namespace is deleted.
+
+### Rollback safety behaviour
+
+- Rules are checked for exact presence before deletion.
+- Dedicated chains are removed only when no references remain.
+- A chain still referenced elsewhere is left untouched and reported as an error.
+- Errors are accumulated rather than stopping all later cleanup immediately.
+- State is retained if rollback reports errors.
+
+### Known limitations
+
+- Namespace deletion does not itself prove every process previously inside the namespace has terminated cleanly.
+- A retained state file after partial rollback does not guarantee that every original resource still exists.
+- The chain removal helper uses the accumulated global error count when deciding whether to proceed from flushing to deleting a chain. A previous unrelated error can therefore prevent deletion after a successful flush.
+- Actual system state must be inspected before retrying an incomplete rollback.
+
+The rollback script does not flush entire firewall tables, delete Docker networks or intentionally remove protected physical interfaces.
+
+---
+
+## B.6 Relationship and lifecycle
+
+The intended management workflow is:
+
+```text
+Existing WP3 installation
+          |
+          v
+   wp3-audit.sh
+          |
+          v
+wp3-isolation-preflight.sh
+          |
+          v
+ Review PASS / WARN / FAIL
+          |
+          v
+ wp3-isolation-setup.sh
+          |
+          v
+ Stage 1 isolation infrastructure
+          |
+          v
+    WP3 runtime lifecycle
+          |
+          v
+ wp3-isolation-rollback.sh
+ (only when Stage 1 removal is intended)
+```
+
+The workflow has two separate lifecycle layers:
+
+**WP3 runtime lifecycle**
+- `wp3-start.sh`
+- `wp3-stop.sh`
+- `wp3-verify.sh`
+
+**Isolation infrastructure lifecycle**
+- `wp3-isolation-preflight.sh`
+- `wp3-isolation-setup.sh`
+- `wp3-isolation-rollback.sh`
+
+`wp3-stop.sh` stops WP3 runtime services; it does not replace isolation rollback. Similarly, isolation rollback should not be used as an ordinary WP3 shutdown procedure.
+
+---
+
+## B.7 Consolidated findings and follow-up items
+
+The following items should be addressed during the later consistency audit. They are documented here without changing any scripts.
+
+| ID | Finding | Review priority |
+|---|---|---|
+| B-01 | Preflight does not explicitly compare AP subnet with transit subnet | Medium |
+| B-02 | Preflight final FAIL handling needs exit-code verification | High |
+| B-03 | Preflight and setup use different default configuration path resolution | High |
+| B-04 | Setup comments describe DNS-only behaviour while general transit forwarding/NAT is also enabled | High |
+| B-05 | `wp3-audit.sh` contains historical source findings that need reassessment after the core patch | High |
+| B-06 | Firewall text scans cannot prove the absence of all dangerous operations | Medium |
+| B-07 | Rollback chain deletion can be blocked by an earlier accumulated error | Medium |
+| B-08 | Namespace deletion and process termination should be verified separately | Medium |
+| B-09 | Docker container count is an operational baseline, not a setup prerequisite | Low |
+| B-10 | Firewall visibility checks do not establish effective IPv6 isolation | Medium |
+
+### Configuration consistency
+
+The isolation configuration file is intended to be the central source for Stage 1 network values. The setup script sources it, and the preflight script also reads it.
+
+However, the setup script's default configuration path is current-working-directory-relative, whereas preflight resolves the file relative to its own script directory.
+
+The runtime scripts also contain some duplicated AP network values. Centralization should be considered only after confirming all consumers and their expected configuration behaviour.
+
+### Overall documentation status
+
+The four scripts have been reviewed from their supplied source excerpts:
+
+- `wp3-audit.sh`: 361 lines.
+- `wp3-isolation-preflight.sh`: 514 lines.
+- `wp3-isolation-setup.sh`: 496 lines.
+- `wp3-isolation-rollback.sh`: 325 lines.
+
+No modifications were made during this review.
+
+This appendix records the observed implementation and known limitations. It does not constitute a certification that the isolation design is production-ready. Final approval requires the planned setup/rollback consistency audit, policy clarification and controlled validation of the actual runtime behaviour.
+
+**End of Appendix B.**
 
 ---
 
