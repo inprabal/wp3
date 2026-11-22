@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# WP3 complete service and firewall startup
+# Does not modify host isolation infrastructure.
+
+set -euo pipefail
+
+ROOT="/home/kali/wifipumpkin3"
+NS="wp3-ns"
+LOGDIR="/var/log/wp3"
+
+if [[ $EUID -eq 0 ]]; then
+    echo "Run as kali: bash ~/wifipumpkin3/wp3-start.sh"
+    exit 1
+fi
+
+capture() {
+    echo
+    echo "===== $1 snapshot ====="
+    "$ROOT/wp3-capture-baseline.sh" || {
+        echo "ERROR: Snapshot failed."
+        exit 1
+    }
+}
+
+capture "BEFORE START"
+sudo -v
+
+sudo ip netns list | grep -q "^${NS}[[:space:]]" || {
+    echo "ERROR: Namespace $NS does not exist."
+    exit 1
+}
+
+sudo ip netns exec "$NS" ip link show wlan2 >/dev/null 2>&1 || {
+    echo "ERROR: wlan2 is unavailable inside $NS."
+    exit 1
+}
+
+sudo install -d -o kali -g kali "$LOGDIR"
+
+echo
+echo "Starting DHCP/DNS..."
+
+if ! sudo ip netns exec "$NS" pgrep -x dnsmasq >/dev/null 2>&1; then
+    sudo bash "$ROOT/wp3-dnsmasq-start.sh"
+else
+    echo "dnsmasq already running."
+fi
+
+echo
+echo "Starting WP3 tmux session..."
+
+if ! sudo tmux has-session -t wp3 2>/dev/null; then
+    sudo tmux new-session -d -s wp3 \
+        "ip netns exec wp3-ns env HOME=/home/kali /usr/bin/wifipumpkin3 -i wlan2"
+
+    sudo tmux pipe-pane -o -t wp3 \
+        "cat >> /var/log/wp3/wifipumpkin3.log"
+fi
+
+echo
+echo "=================================================="
+echo "Attach to WP3 console."
+echo "Type: start"
+echo "Wait until the AP has started successfully."
+echo "Then detach using: Ctrl+B, followed by D"
+echo "=================================================="
+read -r -p "Press ENTER when ready to attach to WP3..."
+
+sudo tmux attach-session -t wp3
+
+echo
+echo "Checking AP interface..."
+
+if ! sudo ip netns exec "$NS" ip -4 addr show dev wlan2 |
+    grep -q '172.16.0.1/24'; then
+    echo "ERROR: AP address 172.16.0.1/24 not found."
+    echo "Firewall initialization aborted."
+    exit 1
+fi
+
+echo
+echo "Applying persistent runtime firewall policy..."
+
+# 1. Permit established return traffic to namespace services.
+sudo ip netns exec "$NS" iptables -C INPUT \
+    -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+sudo ip netns exec "$NS" iptables -I INPUT 1 \
+    -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+echo "Installing AP services firewall..."
+sudo bash "$ROOT/wp3-ap-services-firewall.sh"
+
+# 2. Captive HTTP redirection.
+sudo bash "$ROOT/wp3-captive-firewall.sh"
+
+# 3. Explicit portal access.
+sudo bash "$ROOT/wp3-portal-firewall.sh"
+
+# 4. Authorised-client forwarding policy.
+sudo bash "$ROOT/wp3-internet-firewall.sh"
+
+echo
+echo "Starting Flask captive portal..."
+
+if ! pgrep -f '^/usr/bin/python3 /home/kali/wifipumpkin3/wp3-portal.py$' >/dev/null 2>&1; then
+    sudo sh -c 'nohup ip netns exec wp3-ns runuser -u kali -- /usr/bin/python3 /home/kali/wifipumpkin3/wp3-portal.py >> /var/log/wp3/portal.log 2>&1 </dev/null &'
+else
+    echo "Flask portal already running."
+fi
+
+sleep 3
+
+echo
+echo "===== FIREWALL VERIFICATION ====="
+sudo ip netns exec "$NS" iptables -S INPUT
+sudo ip netns exec "$NS" iptables -S FORWARD
+sudo ip netns exec "$NS" iptables -S WP3_AUTH
+sudo ip netns exec "$NS" iptables -t nat -S
+
+echo
+echo "===== PROCESS STATUS ====="
+pgrep -a -f 'wifipumpkin3|hostapd|wp3-portal.py' || true
+
+echo
+echo "===== DNSMASQ STATUS ====="
+sudo ip netns exec "$NS" pgrep -a dnsmasq || true
+
+capture "AFTER START"
+
+echo
+echo "WP3 startup and firewall initialization completed."
+echo "Host isolation infrastructure was not modified."

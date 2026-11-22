@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Start WP3 application services only.
+# Automatically captures before/after snapshots.
+# Does not create or modify isolation infrastructure.
+
+set -u
+
+ROOT="/home/kali/wifipumpkin3"
+NS="wp3-ns"
+LOGDIR="/var/log/wp3"
+
+if [[ $EUID -eq 0 ]]; then
+    echo "Run as kali: bash ~/wifipumpkin3/wp3-start.sh"
+    exit 1
+fi
+
+capture() {
+    echo
+    echo "===== $1 snapshot ====="
+    "$ROOT/wp3-capture-baseline.sh" || {
+        echo "ERROR: Snapshot failed. Aborting operation."
+        exit 1
+    }
+}
+
+capture "BEFORE START"
+
+sudo -v || exit 1
+
+if ! sudo ip netns list | grep -q "^${NS}[[:space:]]"; then
+    echo "ERROR: Namespace $NS does not exist."
+    exit 1
+fi
+
+if ! sudo ip netns exec "$NS" ip link show wlan2 >/dev/null 2>&1; then
+    echo "ERROR: wlan2 is not available inside $NS."
+    exit 1
+fi
+
+sudo install -d -o kali -g kali "$LOGDIR" || exit 1
+
+echo
+echo "Starting WP3 services..."
+
+# 1. DHCP/DNS
+if ! sudo ip netns exec "$NS" pgrep -x dnsmasq >/dev/null 2>&1; then
+    sudo bash "$ROOT/wp3-dnsmasq-start.sh" || exit 1
+else
+    echo "dnsmasq already running."
+fi
+
+# 2. WiFi-Pumpkin3 and AP
+if ! pgrep -f '^/usr/bin/python3 /usr/bin/wifipumpkin3 -i wlan2$' >/dev/null 2>&1; then
+    sudo sh -c 'nohup ip netns exec wp3-ns env HOME=/home/kali /usr/bin/wifipumpkin3 -i wlan2 >> /var/log/wp3/wifipumpkin3.log 2>&1 </dev/null &'
+    echo "WP3 launch requested."
+else
+    echo "WiFi-Pumpkin3 already running."
+fi
+
+# 3. Custom Flask portal
+if ! pgrep -f '^/usr/bin/python3 /home/kali/wifipumpkin3/wp3-portal.py$' >/dev/null 2>&1; then
+    sudo sh -c 'nohup ip netns exec wp3-ns runuser -u kali -- /usr/bin/python3 /home/kali/wifipumpkin3/wp3-portal.py >> /var/log/wp3/portal.log 2>&1 </dev/null &'
+    echo "Flask portal launch requested."
+else
+    echo "Flask portal already running."
+fi
+
+sleep 5
+
+echo
+echo "===== WP3 process status ====="
+pgrep -a -f 'wifipumpkin3|hostapd|wp3-portal.py' || true
+
+echo
+echo "===== Namespace dnsmasq status ====="
+sudo ip netns exec "$NS" pgrep -a dnsmasq || true
+
+echo
+
+capture "AFTER START"
+
+echo
+echo "WP3 start operation completed."
+echo "Review process status, logs and snapshot reports."
+echo "Network isolation infrastructure was not modified."
+
+echo
+echo "===== WP3 LOG FILES ====="
+echo "WiFi-Pumpkin3 : /var/log/wp3/wifipumpkin3.log"
+echo "Flask Portal  : /var/log/wp3/portal.log"

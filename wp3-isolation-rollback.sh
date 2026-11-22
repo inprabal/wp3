@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+#
+# WP3 Stage 1 isolation rollback
+# Default: DRY RUN
+# Apply:   sudo ./wp3-isolation-rollback.sh --apply
+#
+# This script only rolls back a completed Stage 1 setup recorded
+# in the state file. It does not attempt recovery from an interrupted
+# setup with no completed state file.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG="$SCRIPT_DIR/wp3-isolation.conf"
+APPLY=0
+ERRORS=0
+
+if [[ "${1:-}" == "--apply" ]]; then
+    APPLY=1
+elif [[ $# -gt 0 ]]; then
+    echo "Usage: $0 [--apply]"
+    exit 2
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "ERROR: Configuration file not found: $CONFIG"
+    exit 1
+fi
+
+# This is the same trusted local configuration used by the setup script.
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+: "${WP3_NETNS:?Missing WP3_NETNS in configuration}"
+: "${VETH_HOST:?Missing VETH_HOST in configuration}"
+: "${VETH_NS:?Missing VETH_NS in configuration}"
+: "${UPLINK_INTERFACE:?Missing UPLINK_INTERFACE in configuration}"
+: "${WP3_SUBNET:?Missing WP3_SUBNET in configuration}"
+: "${TRANSIT_HOST_IP:?Missing TRANSIT_HOST_IP in configuration}"
+: "${TRANSIT_NS_IP:?Missing TRANSIT_NS_IP in configuration}"
+: "${WP3_STATE_DIR:?Missing WP3_STATE_DIR in configuration}"
+
+STATE_FILE="$WP3_STATE_DIR/setup.state"
+
+IP="$(command -v ip)" || { echo "ERROR: ip command not found"; exit 1; }
+IPT="$(command -v iptables-legacy || command -v iptables)" ||
+    { echo "ERROR: iptables command not found"; exit 1; }
+IP6T="$(command -v ip6tables-legacy || command -v ip6tables)" ||
+    { echo "ERROR: ip6tables command not found"; exit 1; }
+
+FWD_CHAIN="WP3_ISO_FWD"
+INPUT_CHAIN="WP3_ISO_IN"
+NAT_COMMENT="WP3_ISOLATION_NAT"
+NAT_DNS_UDP_COMMENT="WP3_ISOLATION_DNS_UDP"
+NAT_DNS_TCP_COMMENT="WP3_ISOLATION_DNS_TCP"
+NAT_TRANSIT_COMMENT="WP3_ISOLATION_TRANSIT_NAT"
+
+echo "=================================================="
+echo " WP3 ISOLATION ROLLBACK"
+echo "=================================================="
+echo "Mode:       $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY RUN)"
+echo "Namespace:  $WP3_NETNS"
+echo "Host veth:  $VETH_HOST"
+echo "NS veth:    $VETH_NS"
+echo "Uplink:     $UPLINK_INTERFACE"
+echo "AP subnet:  $WP3_SUBNET"
+echo "State file: $STATE_FILE"
+echo
+
+# Never guess what to remove. A completed state file is mandatory.
+if [[ ! -f "$STATE_FILE" ]]; then
+    echo "ERROR: Completed setup state file not found."
+    echo "No changes made. This script cannot recover an interrupted setup."
+    exit 1
+fi
+
+if [[ "$(stat -c '%a' "$STATE_FILE" 2>/dev/null)" != "600" ]]; then
+    echo "ERROR: State file permissions are not 0600."
+    echo "Inspect the file before proceeding. No changes made."
+    exit 1
+fi
+
+# Read only expected key/value entries. Do not execute the state file.
+declare -A STATE=()
+
+while IFS='=' read -r key value; do
+    [[ -n "$key" ]] || continue
+    STATE["$key"]="$value"
+done < "$STATE_FILE"
+
+required_state=(
+    WP3_SETUP_STAGE1
+    WP3_NETNS
+    VETH_HOST
+    VETH_NS
+    UPLINK_INTERFACE
+    WP3_SUBNET
+    TRANSIT_HOST_IP
+    TRANSIT_NS_IP
+    FWD_CHAIN
+    INPUT_CHAIN
+    NAT_COMMENT
+    NAT_DNS_UDP_COMMENT
+    NAT_DNS_TCP_COMMENT
+    NAT_TRANSIT_COMMENT
+    HOST_IPV6_INPUT_DROP
+    HOST_IPV6_FORWARD_DROP
+    DNS_UDP_NAT
+    DNS_TCP_NAT
+    TRANSIT_NAT
+)
+
+for key in "${required_state[@]}"; do
+    if [[ -z "${STATE[$key]:-}" ]]; then
+        echo "ERROR: State file is missing required entry: $key"
+        exit 1
+    fi
+done
+
+if [[ "${STATE[WP3_SETUP_STAGE1]}" != "complete" ]]; then
+    echo "ERROR: State file does not record a completed Stage 1 setup."
+    exit 1
+fi
+
+# Verify that the recorded resources match the current configuration.
+for key in WP3_NETNS VETH_HOST VETH_NS UPLINK_INTERFACE \
+           WP3_SUBNET TRANSIT_HOST_IP TRANSIT_NS_IP; do
+    config_key="$key"
+    if [[ "${STATE[$key]}" != "${!config_key}" ]]; then
+        echo "ERROR: State/configuration mismatch for $key."
+        echo "No changes made."
+        exit 1
+    fi
+done
+
+if [[ "${STATE[FWD_CHAIN]}" != "$FWD_CHAIN" ||
+      "${STATE[INPUT_CHAIN]}" != "$INPUT_CHAIN" ||
+      "${STATE[NAT_COMMENT]}" != "$NAT_COMMENT" ||
+      "${STATE[NAT_DNS_UDP_COMMENT]}" != "$NAT_DNS_UDP_COMMENT" ||
+      "${STATE[NAT_DNS_TCP_COMMENT]}" != "$NAT_DNS_TCP_COMMENT" ||
+      "${STATE[NAT_TRANSIT_COMMENT]}" != "$NAT_TRANSIT_COMMENT" ||
+      "${STATE[HOST_IPV6_INPUT_DROP]}" != "1" ||
+      "${STATE[HOST_IPV6_FORWARD_DROP]}" != "1" ||
+      "${STATE[DNS_UDP_NAT]}" != "1" ||
+      "${STATE[DNS_TCP_NAT]}" != "1" ||
+      "${STATE[TRANSIT_NAT]}" != "1" ]]; then
+    echo "ERROR: State file does not match the expected WP3 rules."
+    echo "No changes made."
+    exit 1
+fi
+
+# Execute a cleanup command only in APPLY mode.
+run_cmd() {
+    printf '  '
+    printf '%q ' "$@"
+    echo
+
+    if [[ $APPLY -eq 1 ]]; then
+        "$@"
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+            echo "  ERROR: command failed (exit $rc)"
+            ERRORS=$((ERRORS + 1))
+        fi
+    fi
+}
+
+# Delete an exact rule only if it currently exists.
+delete_rule() {
+    local binary="$1"
+    local table="$2"
+    local chain="$3"
+    shift 3
+
+    if "$binary" -t "$table" -C "$chain" "$@" 2>/dev/null; then
+        run_cmd "$binary" -t "$table" -D "$chain" "$@"
+    else
+        echo "  Already absent: $chain rule"
+    fi
+}
+
+# Remove a dedicated WP3 chain only when it has no remaining references.
+remove_dedicated_chain() {
+    local binary="$1"
+    local chain="$2"
+
+    if ! "$binary" -S "$chain" >/dev/null 2>&1; then
+        echo "  Chain already absent: $chain"
+        return
+    fi
+
+    if "$binary" -S 2>/dev/null | awk -v target="$chain" '
+        $1 == "-A" {
+            for (i = 2; i < NF; i++) {
+                if (($i == "-j" || $i == "--jump" ||
+                     $i == "-g" || $i == "--goto") &&
+                    $(i+1) == target) found = 1
+            }
+        }
+        END { exit !found }
+    '; then
+        echo "  ERROR: $chain still has references; leaving it untouched."
+        ERRORS=$((ERRORS + 1))
+        return
+    fi
+
+    run_cmd "$binary" -F "$chain"
+    if [[ $APPLY -eq 1 && $ERRORS -gt 0 ]]; then
+        return
+    fi
+    run_cmd "$binary" -X "$chain"
+}
+
+echo "========== HOST FIREWALL RULES =========="
+
+# INPUT jump and its dedicated chain.
+delete_rule "$IPT" filter INPUT \
+    -i "$VETH_HOST" -j "$INPUT_CHAIN"
+
+remove_dedicated_chain "$IPT" "$INPUT_CHAIN"
+
+# Both FORWARD jumps into the dedicated WP3 chain.
+delete_rule "$IPT" filter FORWARD \
+    -o "$VETH_HOST" -j "$FWD_CHAIN"
+
+delete_rule "$IPT" filter FORWARD \
+    -i "$VETH_HOST" -j "$FWD_CHAIN"
+
+remove_dedicated_chain "$IPT" "$FWD_CHAIN"
+
+echo
+echo "========== HOST IPv6 RULES =========="
+
+delete_rule "$IP6T" filter INPUT \
+    -i "$VETH_HOST" -j DROP
+
+delete_rule "$IP6T" filter FORWARD \
+    -i "$VETH_HOST" -j DROP
+
+delete_rule "$IP6T" filter FORWARD \
+    -o "$VETH_HOST" -j DROP
+
+echo
+echo "========== HOST NAT RULES =========="
+
+delete_rule "$IPT" nat POSTROUTING \
+    -s "$WP3_SUBNET" -o "$UPLINK_INTERFACE" \
+    -m comment --comment "$NAT_COMMENT" \
+    -j MASQUERADE
+
+delete_rule "$IPT" nat POSTROUTING \
+    -s "$TRANSIT_NS_IP" -o "$UPLINK_INTERFACE" \
+    -p udp --dport 53 \
+    -m comment --comment "$NAT_DNS_UDP_COMMENT" \
+    -j MASQUERADE
+
+delete_rule "$IPT" nat POSTROUTING \
+    -s "$TRANSIT_NS_IP" -o "$UPLINK_INTERFACE" \
+    -p tcp --dport 53 \
+    -m comment --comment "$NAT_DNS_TCP_COMMENT" \
+    -j MASQUERADE
+
+delete_rule "$IPT" nat POSTROUTING \
+    -s "$TRANSIT_NS_IP" -o "$UPLINK_INTERFACE" \
+    -m comment --comment "$NAT_TRANSIT_COMMENT" \
+    -j MASQUERADE
+
+echo
+echo "========== HOST ROUTE =========="
+
+if "$IP" route show "$WP3_SUBNET" 2>/dev/null |
+   grep -Eq "^${WP3_SUBNET//./\\.} via ${TRANSIT_NS_IP//./\\.} dev ${VETH_HOST}([[:space:]]|$)"; then
+    run_cmd "$IP" route del "$WP3_SUBNET" \
+        via "$TRANSIT_NS_IP" dev "$VETH_HOST"
+else
+    echo "  Exact WP3 route already absent; no route removed."
+fi
+
+echo
+echo "========== NETWORK NAMESPACE =========="
+
+if "$IP" netns list 2>/dev/null |
+   awk '{print $1}' | grep -Fxq "$WP3_NETNS"; then
+    run_cmd "$IP" netns del "$WP3_NETNS"
+else
+    echo "  Namespace already absent: $WP3_NETNS"
+fi
+
+echo
+echo "========== HOST VETH =========="
+
+if "$IP" link show dev "$VETH_HOST" >/dev/null 2>&1; then
+    run_cmd "$IP" link del "$VETH_HOST"
+else
+    echo "  Host veth already absent: $VETH_HOST"
+fi
+
+echo
+echo "========== STATE FILE =========="
+
+if [[ $APPLY -eq 1 ]]; then
+    if [[ $ERRORS -eq 0 ]]; then
+        run_cmd rm -f -- "$STATE_FILE"
+    else
+        echo "  Cleanup errors occurred. State file retained for investigation."
+    fi
+else
+    echo "  DRY RUN: state file would be removed after successful cleanup."
+fi
+
+echo
+echo "=================================================="
+
+if [[ $APPLY -eq 0 ]]; then
+    echo "DRY RUN COMPLETE — no changes were made."
+    echo "Review the proposed actions before using --apply."
+elif [[ $ERRORS -eq 0 ]]; then
+    echo "ROLLBACK COMPLETE."
+else
+    echo "ROLLBACK INCOMPLETE — $ERRORS error(s)."
+    echo "State file retained where possible. Inspect before retrying."
+    exit 1
+fi
+
+echo "=================================================="

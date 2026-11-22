@@ -1,0 +1,176 @@
+
+============================================================
+WP3 VERIFICATION REPORT
+============================================================
+Date: Sat Nov 21 12:32:27 AM IST 2026
+Host: mypi
+Namespace: wp3-ns
+Report: /home/kali/wifipumpkin3/reports/wp3-verify-20261121-003227.txt
+
+============================================================
+1. WP3 APPLICATION
+============================================================
+[PASS] WP3 tmux session exists
+3470544 tmux new-session -d -s wp3 ip netns exec wp3-ns env HOME=/home/kali /usr/bin/wifipumpkin3 -i wlan2
+3470545 /usr/bin/python3 /usr/bin/wifipumpkin3 -i wlan2
+3470550 sh -c cat >> /var/log/wp3/wifipumpkin3.log
+3470645 /usr/sbin/hostapd /home/kali/.config/wifipumpkin3/config/hostapd/hostapd.conf
+3470949 runuser -u kali -- /usr/bin/python3 /home/kali/wifipumpkin3/wp3-portal.py
+3470951 /usr/bin/python3 /home/kali/wifipumpkin3/wp3-portal.py
+3471492 tee /home/kali/wifipumpkin3/reports/wp3-verify-20261121-003227.txt
+[PASS] WP3 application process found
+
+============================================================
+2. ACCESS POINT
+============================================================
+[PASS] wlan2 interface is UP
+[PASS] wlan2 has 172.16.0.1/24
+3470645 /usr/sbin/hostapd /home/kali/.config/wifipumpkin3/config/hostapd/hostapd.conf
+[PASS] hostapd process found
+
+============================================================
+3. DHCP AND DNS
+============================================================
+[PASS] dnsmasq process running
+[PASS] DNS UDP port 53 listening
+Current DHCP leases:
+1795240189 02:d8:20:da:8a:5e 172.16.0.148 STG-LX2 01:02:d8:20:da:8a:5e
+1795239820 82:45:fd:01:39:e8 172.16.0.105 * 01:82:45:fd:01:39:e8
+1795242722 32:87:bf:3a:ec:c9 172.16.0.144 Prabal-s-S24 01:32:87:bf:3a:ec:c9
+1795242611 16:46:10:6e:32:ad 172.16.0.142 realme-9-Pro 01:16:46:10:6e:32:ad
+[PASS] DHCP lease file readable
+
+============================================================
+4. CAPTIVE PORTAL
+============================================================
+[PASS] Portal listening on 172.16.0.1:8080
+
+============================================================
+5. FIREWALL INPUT
+============================================================
+-P INPUT DROP
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -i wlan2 -j ACCEPT
+-A INPUT -s 8.8.8.8/32 -d 169.254.250.2/32 -i veth-wp3-ns -p udp -m udp --sport 53 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A INPUT -s 1.1.1.1/32 -d 169.254.250.2/32 -i veth-wp3-ns -p udp -m udp --sport 53 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -i wlan2 -p udp -m udp --sport 68 --dport 67 -j ACCEPT
+-A INPUT -d 172.16.0.1/32 -i wlan2 -p udp -m udp --dport 53 -j ACCEPT
+-A INPUT -d 172.16.0.1/32 -i wlan2 -p tcp -m tcp --dport 53 -j ACCEPT
+-A INPUT -s 172.16.0.0/24 -d 172.16.0.1/32 -i wlan2 -p tcp -m tcp --dport 8080 -j ACCEPT
+[PASS] INPUT established/related rule present
+
+============================================================
+6. FIREWALL FORWARD
+============================================================
+-P FORWARD DROP
+-A FORWARD -i veth-wp3-ns -o wlan2 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i wlan2 -j WP3_AUTH
+-A FORWARD -i veth-wp3-ns -o wlan2 -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i wlan2 -o veth-wp3-ns -j ACCEPT
+[PASS] AP traffic routed through WP3_AUTH
+
+============================================================
+7. AUTHORIZATION CHAIN
+============================================================
+Chain WP3_AUTH (1 references)
+num   pkts bytes target     prot opt in     out     source               destination         
+1        0     0 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/8           
+2        0     0 DROP       all  --  *      *       0.0.0.0/0            10.0.0.0/8          
+3        0     0 DROP       all  --  *      *       0.0.0.0/0            100.64.0.0/10       
+4        0     0 DROP       all  --  *      *       0.0.0.0/0            127.0.0.0/8         
+5        0     0 DROP       all  --  *      *       0.0.0.0/0            169.254.0.0/16      
+6        0     0 DROP       all  --  *      *       0.0.0.0/0            172.16.0.0/12       
+7        0     0 DROP       all  --  *      *       0.0.0.0/0            192.168.0.0/16      
+8        0     0 DROP       all  --  *      *       0.0.0.0/0            224.0.0.0/4         
+9        0     0 DROP       all  --  *      *       0.0.0.0/0            240.0.0.0/4         
+10       0     0 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           
+[PASS] WP3_AUTH default DROP rule present
+[WARN] No authorised-client ACCEPT rule found
+
+============================================================
+8. NAT AND CAPTIVE REDIRECTION
+============================================================
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+-N WP3_CAPTIVE
+-A PREROUTING -i wlan2 -p tcp -m tcp --dport 80 -j WP3_CAPTIVE
+-A POSTROUTING -o veth-wp3-ns -j MASQUERADE
+-A WP3_CAPTIVE -p tcp -m tcp --dport 80 -j REDIRECT --to-ports 8080
+[PASS] HTTP traffic enters WP3_CAPTIVE
+[PASS] HTTP redirection to portal port 8080 present
+
+============================================================
+9. NAMESPACE INTERNET CONNECTIVITY
+============================================================
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+64 bytes from 1.1.1.1: icmp_seq=1 ttl=54 time=9.37 ms
+64 bytes from 1.1.1.1: icmp_seq=2 ttl=54 time=8.35 ms
+64 bytes from 1.1.1.1: icmp_seq=3 ttl=54 time=8.87 ms
+
+--- 1.1.1.1 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 8.348/8.862/9.370/0.417 ms
+[PASS] Namespace internet connectivity
+
+============================================================
+10. SYSTEM RESOURCES
+============================================================
+CPU and load:
+top - 00:32:31 up 118 days, 11:25,  4 users,  load average: 0.23, 0.27, 0.24
+Tasks: 240 total, 2 running, 234 sleep, 0 d-sleep, 0 stopped, 4 zombie
+%Cpu(s): 17.0 us, 13.0 sy,  0.0 ni, 70.0 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st 
+MiB Mem :   3791.3 total,    857.3 free,    826.0 used,   2174.0 buff/cache     
+MiB Swap:      0.0 total,      0.0 free,      0.0 used.   2965.3 avail Mem 
+
+Memory:
+               total        used        free      shared  buff/cache   available
+Mem:           3.7Gi       824Mi       859Mi        16Mi       2.1Gi       2.9Gi
+Swap:             0B          0B          0B
+
+Disk:
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/mmcblk0p2   59G   21G   35G  38% /
+
+============================================================
+11. LOG ERRORS
+============================================================
+
+Log: /var/log/wp3/wifipumpkin3.log
+    ?0000b?0000b?0000b?00000Pd00000Pd0000Pd000P
+    `?0000b?0000b?0000b?0000Pd0000Pd0000Pd000P'
+     `?000b?0000b?000b?0000Pd000Pd0000Pd000P
+        `~?00b?000b?000b?000Pd00Pd000Pd00P'
+            `~?0b?0b?000b?0Pd0Pd000PdP~'
+                                     codename: [1m[1;36mGao[0m
+by: [1m[33m@mh4x0f[0m - P0cL4bs Team | version: [1m[33m1.1.7[0m [1m[35mmain[0m
+[34m[1m[*][0m Session id: [4m[1m[91mb9d1d4a8-e514-11f1-a65b-6a2adf7f9cf9[0m 
+[4m[1m[34mwp3[0m > start
+[32m[1m[+][0m enable forwarding in iptables...
+[34m[1m[*][0m sharing internet connection with NAT...
+[34m[1m[*][0m setting interface for sharing internet: veth-wp3-ns 
+'list' object has no attribute 'split'
+[32m[1m[+][0m starting hostpad pid: [3470645]
+[4m[1m[34mwp3[0m > [32m[1m[+][0m hostapd is [1m[32mrunning[0m
+
+Log: /var/log/wp3/portal.log
+Terminated
+ * Serving Flask app 'wp3-portal'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://172.16.0.1:8080
+Press CTRL+C to quit
+
+============================================================
+FINAL SUMMARY
+============================================================
+PASS: 15
+WARN: 1
+FAIL: 0
+
+Full report saved to:
+/home/kali/wifipumpkin3/reports/wp3-verify-20261121-003227.txt
+Overall result: WARN - review warnings
+============================================================

@@ -1,0 +1,88 @@
+:root {
+    --background-color: #f2f4f7;
+    --card-color: #ffffff;
+    --primary-color: #1769aa;
+    --text-color: #333333;
+    --muted-color: #555555;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--font-family);
+    background: var(--background-color);
+    color: var(--text-color);
+    margin: 0;
+    padding: 30px 15px;
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 420px;
+    margin: 50px auto;
+    padding: 28px;
+    background: var(--card-color);
+    border-radius: 12px;
+    text-align: center;
+    box-shadow: 0 3px 15px #0002;
+}
+
+h1 {
+    font-size: 25px;
+    margin: 12px 0;
+}
+
+.organization {
+    font-weight: 600;
+    margin-bottom: 24px;
+}
+
+.notice,
+.terms {
+    color: var(--muted-color);
+    line-height: 1.6;
+}
+
+.terms {
+    font-size: 14px;
+}
+
+button {
+    background: var(--primary-color);
+    color: #ffffff;
+    border: 0;
+    padding: 14px 28px;
+    border-radius: 7px;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+button:hover {
+    filter: brightness(0.92);
+}
+
+button:focus-visible {
+    outline: 3px solid var(--text-color);
+    outline-offset: 3px;
+}
+
+.logo {
+    display: block;
+    max-width: 150px;
+    max-height: 90px;
+    object-fit: contain;
+    margin: 0 auto 18px;
+}
+
+.success h1 {
+    color: var(--primary-color);
+}
+
+@media (max-width: 480px) {
+    .container {
+        margin: 20px auto;
+        padding: 24px 18px;
+    }
+}

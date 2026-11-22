@@ -1,0 +1,158 @@
+--- a/usr/lib/python3/dist-packages/wifipumpkin3/core/common/terminal.py
++++ b/usr/lib/python3/dist-packages/wifipumpkin3/core/common/terminal.py
+@@ -75,6 +75,11 @@
+         """Do nothing on empty input line"""
+         pass
+ 
++    def do_EOF(self, args):
++        """Exit cleanly when the input stream reaches EOF."""
++        self._eof_received = True
++        return True
++
+     def precmd(self, line):
+         newline = line.strip()
+         is_cmt = newline.startswith("#")
+@@ -129,8 +134,8 @@
+         self.setOptions()
+ 
+     def cmdloop(self, intro=None):
+-        doQuit = False
+-        while doQuit != True:
++        self._eof_received = False
++        while not self._eof_received:
+             try:
+                 super(ConsoleUI, self).cmdloop(intro="")
+             except KeyboardInterrupt:
+@@ -408,8 +413,8 @@
+                 Cmd.onecmd(self, command)
+ 
+     def cmdloop(self, intro=None):
+-        doQuit = False
+-        while doQuit != True:
++        self._eof_received = False
++        while not self._eof_received:
+             try:
+                 super(ModuleUI, self).cmdloop(intro="")
+             except KeyboardInterrupt:
+--- a/usr/lib/python3/dist-packages/wifipumpkin3/core/controllers/dhcpcontroller.py
++++ b/usr/lib/python3/dist-packages/wifipumpkin3/core/controllers/dhcpcontroller.py
+@@ -38,11 +38,14 @@
+             self.mode[k.ID] = k
+ 
+     def Start(self):
+-        self.Active.Start()
++        if self.Active is not None:
++            self.Active.Start()
+ 
+     @property
+     def ActiveService(self):
+-        return self.Active.service
++        if self.Active is not None:
++            return self.Active.service
++        return None
+ 
+     @property
+     def Active(self):
+@@ -53,17 +56,21 @@
+     @property
+     def ActiveReactor(self):
+         # reactor=[self.Active.reactor,self.Active.service]
+-        return self.Active.reactor
++        if self.Active is not None:
++            return self.Active.reactor
++        return None
+ 
+     def Stop(self):
+-        self.Active.Stop()
++        if self.Active is not None:
++            self.Active.Stop()
+ 
+     def getReactorInfo(self):
+         info_reactor = {}
+-        info_reactor[self.ActiveReactor.getID()] = {
+-            "ID": self.ActiveReactor.getID(),
+-            "PID": self.ActiveReactor.getpid(),
+-        }
++        if self.ActiveReactor is not None:
++            info_reactor[self.ActiveReactor.getID()] = {
++                "ID": self.ActiveReactor.getID(),
++                "PID": self.ActiveReactor.getpid(),
++            }
+         return info_reactor
+ 
+     def setDhcpMode(self, id_module_dhcp):
+--- a/usr/lib/python3/dist-packages/wifipumpkin3/core/controllers/wirelessmodecontroller.py
++++ b/usr/lib/python3/dist-packages/wifipumpkin3/core/controllers/wirelessmodecontroller.py
+@@ -203,10 +203,6 @@
+                 % (self.DHCP["subnet"], self.DHCP["netmask"], self.DHCP["router"]),
+             ],
+             "kill": [
+-                "iptables --flush",
+-                "iptables --table nat --flush",
+-                "iptables --delete-chain",
+-                "iptables --table nat --delete-chain",
+                 "ifconfig %s 0" % (self.SettingsEnable["AP_iface"]),
+                 "killall dhpcd 2>/dev/null",
+             ],
+--- a/usr/lib/python3/dist-packages/wifipumpkin3/core/wirelessmode/static.py
++++ b/usr/lib/python3/dist-packages/wifipumpkin3/core/wirelessmode/static.py
+@@ -85,7 +85,8 @@
+                     info=True,
+                 )
+             )
+-            self.getDHCPMode.removeInactivityClient(data)
++            if self.getDHCPMode is not None:
++                self.getDHCPMode.removeInactivityClient(data)
+ 
+     def setNetworkManager(self, interface=str, Remove=False):
+         """mac address of interface to exclude"""
+--- a/usr/lib/python3/dist-packages/wifipumpkin3/core/wirelessmode/static.py
++++ b/usr/lib/python3/dist-packages/wifipumpkin3/core/wirelessmode/static.py
+@@ -1,6 +1,6 @@
+ from wifipumpkin3.core.config.globalimport import *
+ import weakref
+-from subprocess import check_output, STDOUT, CalledProcessError
++from subprocess import check_output, STDOUT, CalledProcessError, run
+ from wifipumpkin3.core.common.threads import ProcessHostapd
+ from wifipumpkin3.core.servers.dhcp.dhcp import DHCPServers
+ from wifipumpkin3.core.wirelessmode.wirelessmode import Mode
+@@ -216,10 +216,21 @@
+         Linux.set_ip_forward(1)
+         # clean iptables settings
+         for line in self.SettingsAP["kill"]:
+-            exec_bash(line)
+-        # set interface using ifconfig
++            result = run(line, shell=True, capture_output=True, text=True)
++            if result.returncode != 0:
++                print("WP3 cleanup warning: {}: {}".format(
++                    line, result.stderr.strip()
++                ))
++
++        # set interface using ifconfig, synchronously and in order
+         for line in self.SettingsAP["interface"]:
+-            exec_bash(line)
++            result = run(line, shell=True, capture_output=True, text=True)
++            if result.returncode != 0:
++                raise RuntimeError(
++                    "WP3 interface command failed: {}: {}".format(
++                        line, result.stderr.strip()
++                    )
++                )
+         # check if dhcp option is enabled.
+         if self.conf.get("accesspoint", "dhcpd_server", format=bool):
+             self.apply_dhcp_config_leases_config(self.SettingsAP)
+--- a/usr/lib/python3/dist-packages/wifipumpkin3/core/common/threads.py
++++ b/usr/lib/python3/dist-packages/wifipumpkin3/core/common/threads.py
+@@ -180,6 +180,12 @@
+ 
+     def read_OutputCommand(self):
+         self.data = str(self.procHostapd.readAllStandardOutput(), encoding="ascii")
++        try:
++            with open("/var/log/wp3/hostapd-debug.log", "a", encoding="utf-8") as log:
++                log.write(self.data)
++                log.flush()
++        except OSError:
++            pass
+         if (
+             "AP-STA-DISCONNECTED" in self.data.rstrip()
+             or "inactivity (timer DEAUTH/REMOVE)" in self.data.rstrip()

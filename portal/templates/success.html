@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ success.page_title }}</title>
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        :root {
+            --background-color: {{ appearance.background_color }};
+            --card-color: {{ appearance.card_color }};
+            --primary-color: {{ appearance.primary_color }};
+            --text-color: {{ appearance.text_color }};
+            --font-family: {{ appearance.font_family }};
+        }
+    </style>
+</head>
+<body>
+    <main class="container success">
+        {% if branding.logo %}
+        <img class="logo"
+             src="{{ url_for('static', filename=branding.logo) }}"
+             alt="{{ branding.organization }} logo">
+        {% endif %}
+
+        <h1>{{ success.heading }}</h1>
+        <p class="organization">{{ branding.organization }}</p>
+        <p class="notice">{{ success.message }}</p>
+        <p class="terms">{{ success.footer }}</p>
+    </main>
+</body>
+</html>
